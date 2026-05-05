@@ -1,43 +1,63 @@
 """
 BirdNET Detection API — backend para identificación automática de aves.
-Usa birdnetlib (wrapper sobre BirdNET-Analyzer) para el análisis de audio.
-Desplegado en Render.com (Python 3.11), consumido desde Shiny via httr.
+Usa birdnetlib sobre BirdNET-Analyzer.
+Desplegado en Render.com (Python 3.11).
 
-Endpoints:
-  GET  /          → health check / despertar servidor
-  POST /analyze   → recibe audio WAV/MP3, devuelve especies detectadas
+CAMBIO CLAVE: el modelo se carga en el evento 'lifespan' (startup asíncrono),
+permitiendo que uvicorn abra el puerto ANTES de descargar el modelo.
+Esto evita que Render mate el proceso por no detectar el puerto a tiempo.
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from birdnetlib import Recording
-from birdnetlib.analyzer import Analyzer
 import tempfile
 import os
 import traceback
 from typing import Optional
 
 
-# ── Inicialización del analizador (una sola vez al arrancar) ───────────────────
-# Esto es crítico: cargarlo aquí evita hacerlo en cada petición.
-# El modelo TFLite se descarga automáticamente si no existe en disco.
-print("Cargando modelo BirdNET...")
-try:
-    analyzer = Analyzer()
-    print("Modelo BirdNET cargado correctamente.")
-except Exception as e:
-    print(f"Error cargando modelo: {e}")
-    analyzer = None
+# ── Estado global del modelo ───────────────────────────────────────────────────
+# Se llena durante el startup, no en tiempo de importación.
+MODEL = {"analyzer": None, "listo": False, "error": None}
+
+
+# ── Lifespan: carga el modelo DESPUÉS de que uvicorn abre el puerto ────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Código que corre al iniciar el servidor (antes de recibir requests).
+    Al usar lifespan, uvicorn ya tiene el puerto abierto cuando esto corre,
+    evitando el timeout de Render.
+    """
+    print("==> Iniciando servidor BirdNET API...")
+    try:
+        from birdnetlib.analyzer import Analyzer
+        print("==> Descargando/cargando modelo BirdNET (puede tardar 1-2 min)...")
+        MODEL["analyzer"] = Analyzer()
+        MODEL["listo"]    = True
+        print("==> Modelo BirdNET cargado correctamente. Listo para analizar.")
+    except Exception as e:
+        MODEL["error"] = str(e)
+        MODEL["listo"] = False
+        print(f"==> ERROR al cargar modelo: {e}")
+        traceback.print_exc()
+        # No relanzamos — el servidor sigue vivo y devuelve 503 en /analyze
+
+    yield  # <-- el servidor corre aquí
+
+    # Código de cierre (opcional)
+    print("==> Apagando servidor BirdNET API.")
 
 
 # ── Aplicación FastAPI ─────────────────────────────────────────────────────────
 app = FastAPI(
     title       = "BirdNET Detection API",
     description = "Identificación automática de aves desde audio WAV/MP3.",
-    version     = "1.0.0"
+    version     = "1.0.0",
+    lifespan    = lifespan,
 )
 
-# CORS: permite llamadas desde cualquier dominio (incluyendo shinyapps.io)
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -51,44 +71,51 @@ app.add_middleware(
 @app.get("/")
 def health_check():
     """
-    Verifica que la API está activa.
-    Shiny llama esto al cargar la pestaña para despertar el servidor
-    antes de que el usuario suba un audio (evita esperar 30s al analizar).
+    Verifica estado de la API y del modelo.
+    Shiny llama esto al cargar la pestaña para despertar el servidor.
     """
     return {
-        "status"       : "ok",
-        "modelo_listo" : analyzer is not None,
-        "mensaje"      : "API BirdNET activa y lista."
+        "status"       : "ok" if MODEL["listo"] else "iniciando",
+        "modelo_listo" : MODEL["listo"],
+        "error"        : MODEL["error"],
+        "mensaje"      : (
+            "API BirdNET activa y lista." if MODEL["listo"]
+            else "Modelo cargando, intenta en 30 segundos."
+        ),
     }
 
 
 # ── Análisis de audio ──────────────────────────────────────────────────────────
 @app.post("/analyze")
 async def analyze_audio(
-    audio    : UploadFile        = File(...),
-    lat      : Optional[float]   = Form(None),
-    lon      : Optional[float]   = Form(None),
-    week     : Optional[int]     = Form(None),
-    min_conf : float             = Form(0.10),
+    audio    : UploadFile      = File(...),
+    lat      : Optional[float] = Form(None),
+    lon      : Optional[float] = Form(None),
+    week     : Optional[int]   = Form(None),
+    min_conf : float           = Form(0.10),
 ):
     """
-    Analiza un archivo WAV o MP3 y devuelve las especies de aves detectadas.
+    Analiza un archivo WAV o MP3 y devuelve las especies detectadas.
 
-    Parámetros opcionales:
-      lat, lon  → coordenadas del lugar de grabación (mejoran la precisión)
-      week      → semana del año 1-48 (filtra especies por época)
-      min_conf  → confianza mínima 0-1 (default 0.10)
+    Parámetros:
+      audio    → archivo WAV o MP3 (obligatorio)
+      lat, lon → coordenadas del lugar de grabación (mejoran la precisión)
+      week     → semana del año 1-48 (filtra por época del año)
+      min_conf → confianza mínima 0-1 (default: 0.10)
 
-    Para grabaciones en Chile: lat entre -17 y -56, lon entre -66 y -75.
+    Para Chile: lat entre -17 y -56, lon entre -66 y -75.
     """
-
-    if analyzer is None:
+    # Verificar que el modelo esté listo
+    if not MODEL["listo"]:
         raise HTTPException(
             status_code = 503,
-            detail      = "Modelo no disponible. Intenta en unos segundos."
+            detail      = (
+                f"Modelo aún no disponible: {MODEL['error'] or 'cargando'}. "
+                "Espera 30 segundos y reintenta."
+            )
         )
 
-    # Validar formato del archivo
+    # Validar formato
     extension = os.path.splitext(audio.filename or "audio.wav")[-1].lower()
     if extension not in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
         raise HTTPException(
@@ -96,7 +123,7 @@ async def analyze_audio(
             detail      = f"Formato '{extension}' no soportado. Usa WAV o MP3."
         )
 
-    if not (0 <= min_conf <= 1):
+    if not (0.0 <= min_conf <= 1.0):
         raise HTTPException(
             status_code = 400,
             detail      = "min_conf debe estar entre 0 y 1."
@@ -108,15 +135,15 @@ async def analyze_audio(
         with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
             contenido = await audio.read()
             if len(contenido) == 0:
-                raise HTTPException(status_code=400, detail="Archivo vacío.")
+                raise HTTPException(status_code=400, detail="Archivo de audio vacío.")
             tmp.write(contenido)
             tmp_path = tmp.name
 
         # ── Análisis con birdnetlib ────────────────────────────────────────────
-        # Recording acepta lat/lon/week opcionales para filtrar por rango
-        # geográfico-temporal, reduciendo falsos positivos significativamente.
+        from birdnetlib import Recording
+
         recording = Recording(
-            analyzer,
+            MODEL["analyzer"],
             tmp_path,
             lat      = lat,
             lon      = lon,
@@ -126,7 +153,7 @@ async def analyze_audio(
         )
         recording.analyze()
 
-        detecciones_raw = recording.detections  # lista de dicts
+        detecciones_raw = recording.detections
 
         # ── Formatear respuesta ────────────────────────────────────────────────
         detecciones = []
@@ -141,10 +168,9 @@ async def analyze_audio(
                 "confianza_pct"     : f"{confianza * 100:.1f}%",
             })
 
-        # Ordenar: primero por tiempo, luego por confianza descendente
         detecciones.sort(key=lambda x: (x["inicio_seg"], -x["confianza"]))
 
-        # Resumen por especie única (tabla principal en Shiny)
+        # Resumen por especie única
         vistas = {}
         for d in detecciones:
             sp = d["nombre_cientifico"]
@@ -175,8 +201,8 @@ async def analyze_audio(
                 "week"     : week,
                 "min_conf" : min_conf,
             },
-            "especies"          : especies,      # una fila por especie
-            "detecciones"       : detecciones,   # una fila por segmento de 3s
+            "especies"          : especies,
+            "detecciones"       : detecciones,
         }
 
     except HTTPException:
@@ -191,6 +217,5 @@ async def analyze_audio(
         )
 
     finally:
-        # Borrar siempre el archivo temporal
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
