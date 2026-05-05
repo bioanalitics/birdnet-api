@@ -1,4 +1,5 @@
 birdnetlib
+librosa
 fastapi
 uvicorn
 python-multipart
