@@ -1,4 +1,4 @@
-birdnet-analyzer
+birdnetlib
 fastapi
 uvicorn
 python-multipart
