@@ -1,6 +1,6 @@
 birdnetlib
 librosa
+tensorflow
 fastapi
 uvicorn
 python-multipart
-
