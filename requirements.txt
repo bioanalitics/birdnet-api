@@ -1,0 +1,4 @@
+birdent-analyzer
+fastapi
+uvicorn
+python-multipart
