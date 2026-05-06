@@ -1,6 +1,6 @@
 birdnetlib
 librosa
-ai-edge-litert
+tflite-runtime
 fastapi
 uvicorn
 python-multipart
