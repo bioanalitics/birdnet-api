@@ -1,5 +1,6 @@
 birdnetlib
 librosa
+resampy
 tflite-runtime
 numpy<2.0
 fastapi
