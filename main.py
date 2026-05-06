@@ -1,8 +1,36 @@
 """
 BirdNET Detection API — backend para identificación automática de aves.
-Usa birdnetlib sobre BirdNET-Analyzer.
-Desplegado en Render.com (Python 3.11).
+Usa birdnetlib + ai-edge-litert (versión liviana de TFLite, ~30 MB).
+Desplegado en Render.com (Python 3.10).
+
+SHIM DE COMPATIBILIDAD:
+  birdnetlib busca 'tflite_runtime' pero ai-edge-litert se instala como
+  'ai_edge_litert'. El bloque de abajo crea el alias en sys.modules ANTES
+  de que birdnetlib intente importar, resolviendo el ModuleNotFoundError.
 """
+
+# ── Shim: registrar ai_edge_litert como tflite_runtime ────────────────────────
+# Debe ejecutarse ANTES de cualquier import de birdnetlib.
+import sys
+import types
+
+try:
+    import ai_edge_litert.interpreter as _litert_interp
+
+    # Crear módulo ficticio 'tflite_runtime'
+    _tflite_runtime = types.ModuleType("tflite_runtime")
+    _tflite_runtime.interpreter = _litert_interp
+
+    # Registrar en sys.modules para que cualquier 'import tflite_runtime' funcione
+    sys.modules["tflite_runtime"]             = _tflite_runtime
+    sys.modules["tflite_runtime.interpreter"] = _litert_interp
+
+    print("==> Shim tflite_runtime → ai_edge_litert aplicado correctamente.")
+
+except ImportError as _e:
+    print(f"==> ADVERTENCIA: no se pudo aplicar shim tflite_runtime: {_e}")
+# ── Fin shim ───────────────────────────────────────────────────────────────────
+
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -69,10 +97,8 @@ def health_check():
     }
 
 
-# ── Endpoint de prueba sin audio ───────────────────────────────────────────────
 @app.get("/ping")
 def ping():
-    """Verifica que el servidor responde correctamente."""
     return {"pong": True, "modelo_listo": MODEL["listo"]}
 
 
@@ -84,15 +110,6 @@ async def analyze_audio(
     lon      : Optional[float] = Form(None),
     min_conf : float           = Form(0.10),
 ):
-    """
-    Analiza un archivo WAV o MP3 y devuelve las especies de aves detectadas.
-
-    Parámetros:
-      audio    → archivo WAV o MP3 (obligatorio)
-      lat, lon → coordenadas del lugar de grabación (mejoran la precisión)
-      min_conf → confianza mínima 0-1 (default: 0.10)
-    """
-
     if not MODEL["listo"]:
         raise HTTPException(
             status_code = 503,
@@ -117,7 +134,6 @@ async def analyze_audio(
 
     tmp_path = None
     try:
-        # Guardar audio en archivo temporal
         with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
             contenido = await audio.read()
             if len(contenido) == 0:
@@ -128,30 +144,19 @@ async def analyze_audio(
         print(f"[INFO] Analizando '{audio.filename}' "
               f"(lat={lat}, lon={lon}, min_conf={min_conf})")
 
-        # ── Análisis con birdnetlib ────────────────────────────────────────────
-        # IMPORTANTE: birdnetlib 0.18.x no acepta 'overlap' ni 'week'.
-        # lat/lon solo se pasan si están disponibles — si son None se omiten
-        # para evitar errores de tipo en el filtro geográfico interno.
         from birdnetlib import Recording
 
-        kwargs = {
-            "min_conf": min_conf,
-        }
+        kwargs = {"min_conf": min_conf}
         if lat is not None and lon is not None:
             kwargs["lat"] = lat
             kwargs["lon"] = lon
 
-        recording = Recording(
-            MODEL["analyzer"],
-            tmp_path,
-            **kwargs
-        )
+        recording = Recording(MODEL["analyzer"], tmp_path, **kwargs)
         recording.analyze()
 
         detecciones_raw = recording.detections
         print(f"[INFO] Detecciones brutas: {len(detecciones_raw)}")
 
-        # ── Formatear respuesta ────────────────────────────────────────────────
         detecciones = []
         for det in detecciones_raw:
             confianza = round(float(det.get("confidence", 0)), 4)
@@ -166,7 +171,6 @@ async def analyze_audio(
 
         detecciones.sort(key=lambda x: (x["inicio_seg"], -x["confianza"]))
 
-        # Resumen por especie única
         vistas = {}
         for d in detecciones:
             sp = d["nombre_cientifico"]
@@ -185,21 +189,16 @@ async def analyze_audio(
                     vistas[sp]["max_confianza_pct"] = d["confianza_pct"]
 
         especies = sorted(vistas.values(), key=lambda x: -x["max_confianza"])
-
         print(f"[INFO] Especies detectadas: {len(especies)}")
 
         return {
-            "ok"                : True,
-            "archivo"           : audio.filename,
-            "n_detecciones"     : len(detecciones),
-            "n_especies"        : len(especies),
-            "filtros_aplicados" : {
-                "lat"      : lat,
-                "lon"      : lon,
-                "min_conf" : min_conf,
-            },
-            "especies"          : especies,
-            "detecciones"       : detecciones,
+            "ok"            : True,
+            "archivo"       : audio.filename,
+            "n_detecciones" : len(detecciones),
+            "n_especies"    : len(especies),
+            "filtros"       : {"lat": lat, "lon": lon, "min_conf": min_conf},
+            "especies"      : especies,
+            "detecciones"   : detecciones,
         }
 
     except HTTPException:
