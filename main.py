@@ -1,6 +1,10 @@
 """
-BirdNET Detection API — Python 3.10, tflite-runtime, numpy<2.0
+BirdNET Detection API — Python 3.10, tflite-runtime, numpy<2.0, static-ffmpeg
 """
+
+# ── Activar ffmpeg estático ANTES de importar librosa/pydub ───────────────────
+import static_ffmpeg
+static_ffmpeg.add_paths()  # agrega ffmpeg al PATH del proceso
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -53,7 +57,6 @@ async def analyze_audio(
 
     tmp_path = tmp_wav = None
     try:
-        # Guardar audio original
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             data = await audio.read()
             if not data:
@@ -61,18 +64,17 @@ async def analyze_audio(
             tmp.write(data)
             tmp_path = tmp.name
 
-        # ── Recortar a máximo 60 segundos con pydub (ya instalado via birdnetlib) ──
-        # Esto evita timeouts en audios largos en el tier free de Render.
+        # Convertir a WAV con pydub (usa ffmpeg estático)
         try:
             from pydub import AudioSegment
-            MAX_MS = 60_000  # 60 segundos
             seg = AudioSegment.from_file(tmp_path)
-            if len(seg) > MAX_MS:
-                print(f"[INFO] Audio de {len(seg)/1000:.1f}s recortado a 60s")
-                seg = seg[:MAX_MS]
+            if len(seg) > 60_000:
+                print(f"[INFO] Recortando de {len(seg)/1000:.1f}s a 60s")
+                seg = seg[:60_000]
             tmp_wav = tempfile.mktemp(suffix=".wav")
             seg.export(tmp_wav, format="wav")
             analysis_path = tmp_wav
+            print(f"[INFO] Audio convertido a WAV correctamente")
         except Exception as e:
             print(f"[WARN] pydub falló ({e}), usando archivo original")
             analysis_path = tmp_path
