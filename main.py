@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     print("==> Iniciando servidor BirdNET API...")
     try:
         from birdnetlib.analyzer import Analyzer
-        print("==> Cargando modelo BirdNET (puede tardar 1-2 min la primera vez)...")
+        print("==> Cargando modelo BirdNET...")
         MODEL["analyzer"] = Analyzer()
         MODEL["listo"]    = True
         print("==> Modelo BirdNET cargado correctamente.")
@@ -67,6 +67,13 @@ def health_check():
             else "Modelo cargando, intenta en 30 segundos."
         ),
     }
+
+
+# ── Endpoint de prueba sin audio ───────────────────────────────────────────────
+@app.get("/ping")
+def ping():
+    """Verifica que el servidor responde correctamente."""
+    return {"pong": True, "modelo_listo": MODEL["listo"]}
 
 
 # ── Análisis de audio ──────────────────────────────────────────────────────────
@@ -118,20 +125,31 @@ async def analyze_audio(
             tmp.write(contenido)
             tmp_path = tmp.name
 
+        print(f"[INFO] Analizando '{audio.filename}' "
+              f"(lat={lat}, lon={lon}, min_conf={min_conf})")
+
         # ── Análisis con birdnetlib ────────────────────────────────────────────
+        # IMPORTANTE: birdnetlib 0.18.x no acepta 'overlap' ni 'week'.
+        # lat/lon solo se pasan si están disponibles — si son None se omiten
+        # para evitar errores de tipo en el filtro geográfico interno.
         from birdnetlib import Recording
+
+        kwargs = {
+            "min_conf": min_conf,
+        }
+        if lat is not None and lon is not None:
+            kwargs["lat"] = lat
+            kwargs["lon"] = lon
 
         recording = Recording(
             MODEL["analyzer"],
             tmp_path,
-            lat      = lat,
-            lon      = lon,
-            min_conf = min_conf,
-            overlap  = 0.0,
+            **kwargs
         )
         recording.analyze()
 
         detecciones_raw = recording.detections
+        print(f"[INFO] Detecciones brutas: {len(detecciones_raw)}")
 
         # ── Formatear respuesta ────────────────────────────────────────────────
         detecciones = []
@@ -168,6 +186,8 @@ async def analyze_audio(
 
         especies = sorted(vistas.values(), key=lambda x: -x["max_confianza"])
 
+        print(f"[INFO] Especies detectadas: {len(especies)}")
+
         return {
             "ok"                : True,
             "archivo"           : audio.filename,
@@ -186,12 +206,10 @@ async def analyze_audio(
         raise
 
     except Exception as e:
-        print(f"[ERROR] Fallo al analizar '{audio.filename}':")
+        msg = f"Error al procesar el audio: {type(e).__name__}: {str(e)}"
+        print(f"[ERROR] {msg}")
         traceback.print_exc()
-        raise HTTPException(
-            status_code = 500,
-            detail      = f"Error al procesar el audio: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=msg)
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
