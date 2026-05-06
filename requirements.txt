@@ -2,6 +2,7 @@ birdnetlib
 librosa
 tflite-runtime
 numpy<2.0
+static-ffmpeg
 fastapi
 uvicorn
 python-multipart
