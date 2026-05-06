@@ -1,36 +1,11 @@
 """
 BirdNET Detection API — backend para identificación automática de aves.
-Usa birdnetlib + ai-edge-litert (versión liviana de TFLite, ~30 MB).
-Desplegado en Render.com (Python 3.10).
+Usa birdnetlib + tflite-runtime (Python 3.10, ~10 MB, cabe en tier free).
+Desplegado en Render.com.
 
-SHIM DE COMPATIBILIDAD:
-  birdnetlib busca 'tflite_runtime' pero ai-edge-litert se instala como
-  'ai_edge_litert'. El bloque de abajo crea el alias en sys.modules ANTES
-  de que birdnetlib intente importar, resolviendo el ModuleNotFoundError.
+Dependencias en requirements.txt:
+  birdnetlib, librosa, tflite-runtime, fastapi, uvicorn, python-multipart
 """
-
-# ── Shim: registrar ai_edge_litert como tflite_runtime ────────────────────────
-# Debe ejecutarse ANTES de cualquier import de birdnetlib.
-import sys
-import types
-
-try:
-    import ai_edge_litert.interpreter as _litert_interp
-
-    # Crear módulo ficticio 'tflite_runtime'
-    _tflite_runtime = types.ModuleType("tflite_runtime")
-    _tflite_runtime.interpreter = _litert_interp
-
-    # Registrar en sys.modules para que cualquier 'import tflite_runtime' funcione
-    sys.modules["tflite_runtime"]             = _tflite_runtime
-    sys.modules["tflite_runtime.interpreter"] = _litert_interp
-
-    print("==> Shim tflite_runtime → ai_edge_litert aplicado correctamente.")
-
-except ImportError as _e:
-    print(f"==> ADVERTENCIA: no se pudo aplicar shim tflite_runtime: {_e}")
-# ── Fin shim ───────────────────────────────────────────────────────────────────
-
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -51,7 +26,7 @@ async def lifespan(app: FastAPI):
     print("==> Iniciando servidor BirdNET API...")
     try:
         from birdnetlib.analyzer import Analyzer
-        print("==> Cargando modelo BirdNET...")
+        print("==> Cargando modelo BirdNET con tflite-runtime...")
         MODEL["analyzer"] = Analyzer()
         MODEL["listo"]    = True
         print("==> Modelo BirdNET cargado correctamente.")
@@ -110,6 +85,10 @@ async def analyze_audio(
     lon      : Optional[float] = Form(None),
     min_conf : float           = Form(0.10),
 ):
+    """
+    Analiza un archivo WAV o MP3 y devuelve las especies detectadas.
+    lat/lon opcionales — mejoran precisión filtrando por rango geográfico.
+    """
     if not MODEL["listo"]:
         raise HTTPException(
             status_code = 503,
@@ -146,6 +125,7 @@ async def analyze_audio(
 
         from birdnetlib import Recording
 
+        # lat/lon solo se pasan si tienen valor — evita errores internos con None
         kwargs = {"min_conf": min_conf}
         if lat is not None and lon is not None:
             kwargs["lat"] = lat
@@ -157,6 +137,7 @@ async def analyze_audio(
         detecciones_raw = recording.detections
         print(f"[INFO] Detecciones brutas: {len(detecciones_raw)}")
 
+        # ── Formatear respuesta ────────────────────────────────────────────────
         detecciones = []
         for det in detecciones_raw:
             confianza = round(float(det.get("confidence", 0)), 4)
@@ -171,6 +152,7 @@ async def analyze_audio(
 
         detecciones.sort(key=lambda x: (x["inicio_seg"], -x["confianza"]))
 
+        # Resumen por especie única
         vistas = {}
         for d in detecciones:
             sp = d["nombre_cientifico"]
