@@ -1,6 +1,7 @@
 birdnetlib
 librosa
 tflite-runtime
+numpy<2.0
 fastapi
 uvicorn
 python-multipart
