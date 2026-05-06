@@ -1,10 +1,8 @@
 """
-BirdNET Detection API — Python 3.10, tflite-runtime, numpy<2.0, static-ffmpeg
+BirdNET Detection API — Python 3.10, tflite-runtime, numpy<2.0
+Solo acepta WAV — no requiere ffmpeg ni static-ffmpeg.
+librosa lee WAV nativamente via soundfile sin dependencias externas.
 """
-
-# ── Activar ffmpeg estático ANTES de importar librosa/pydub ───────────────────
-import static_ffmpeg
-static_ffmpeg.add_paths()  # agrega ffmpeg al PATH del proceso
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -52,32 +50,20 @@ async def analyze_audio(
         raise HTTPException(503, detail=f"Modelo no listo: {MODEL['error'] or 'cargando'}")
 
     ext = os.path.splitext(audio.filename or "audio.wav")[-1].lower()
-    if ext not in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
-        raise HTTPException(400, detail=f"Formato '{ext}' no soportado.")
+    if ext != ".wav":
+        raise HTTPException(400, detail="Solo se aceptan archivos WAV. Convierte tu audio a WAV antes de subirlo.")
 
-    tmp_path = tmp_wav = None
+    if not (0.0 <= min_conf <= 1.0):
+        raise HTTPException(400, detail="min_conf debe estar entre 0 y 1.")
+
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             data = await audio.read()
             if not data:
                 raise HTTPException(400, detail="Archivo vacío.")
             tmp.write(data)
             tmp_path = tmp.name
-
-        # Convertir a WAV con pydub (usa ffmpeg estático)
-        try:
-            from pydub import AudioSegment
-            seg = AudioSegment.from_file(tmp_path)
-            if len(seg) > 60_000:
-                print(f"[INFO] Recortando de {len(seg)/1000:.1f}s a 60s")
-                seg = seg[:60_000]
-            tmp_wav = tempfile.mktemp(suffix=".wav")
-            seg.export(tmp_wav, format="wav")
-            analysis_path = tmp_wav
-            print(f"[INFO] Audio convertido a WAV correctamente")
-        except Exception as e:
-            print(f"[WARN] pydub falló ({e}), usando archivo original")
-            analysis_path = tmp_path
 
         print(f"[INFO] Analizando '{audio.filename}' lat={lat} lon={lon} min_conf={min_conf}")
 
@@ -87,7 +73,7 @@ async def analyze_audio(
             kwargs["lat"] = lat
             kwargs["lon"] = lon
 
-        recording = Recording(MODEL["analyzer"], analysis_path, **kwargs)
+        recording = Recording(MODEL["analyzer"], tmp_path, **kwargs)
         recording.analyze()
 
         raw = recording.detections
@@ -131,6 +117,5 @@ async def analyze_audio(
         traceback.print_exc()
         raise HTTPException(500, detail=f"Error al procesar audio: {msg}")
     finally:
-        for p in [tmp_path, tmp_wav]:
-            if p and os.path.exists(p):
-                os.unlink(p)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
